@@ -1,138 +1,253 @@
-use std::io::{stdin, stdout, Write};
+use std::io::{self, Write};
+use std::mem;
+use std::ptr;
 
-// https://cstack.github.io/db_tutorial/
+// Constants
+const COLUMN_USERNAME_SIZE: usize = 32;
+const COLUMN_EMAIL_SIZE: usize = 255;
+const TABLE_MAX_ROWS: usize = 100;
+const ROW_SIZE: usize = mem::size_of::<u32>() * 3 + COLUMN_USERNAME_SIZE + COLUMN_EMAIL_SIZE;
+const PAGE_SIZE: usize = 4096;
+const ROWS_PER_PAGE: usize = PAGE_SIZE / ROW_SIZE;
+const TABLE_MAX_PAGES: usize = TABLE_MAX_ROWS / ROWS_PER_PAGE;
 
-enum PrepareResult {
-    Success,               // 성공
-    UnrecognizedStatement, // 인식 할 수 없는 명령어
+// Enums
+enum MetaCommandResult {
+    Success,
+    UnrecognizedCommand,
 }
 
-enum MetaCommandResult {
-    Success,             // 성공
-    UnrecognizedCommand, // 인식 할 수 없는 명령어
+enum PrepareResult {
+    Success,
+    SyntaxError,
+    UnrecognizedStatement,
 }
 
 enum StatementType {
-    Insert, // 삽입
-    Select, // 선택
+    Insert,
+    Select,
+}
+
+// Structs
+struct Row {
+    id: u32,
+    username: [u8; COLUMN_USERNAME_SIZE],
+    email: [u8; COLUMN_EMAIL_SIZE],
+}
+
+impl Row {
+    fn new(id: u32, username: &str, email: &str) -> Row {
+        let mut username_bytes = [0; COLUMN_USERNAME_SIZE];
+        let mut email_bytes = [0; COLUMN_EMAIL_SIZE];
+
+        for (i, c) in username.chars().enumerate() {
+            username_bytes[i] = c as u8;
+        }
+
+        for (i, c) in email.chars().enumerate() {
+            email_bytes[i] = c as u8;
+        }
+
+        Row {
+            id,
+            username: username_bytes,
+            email: email_bytes,
+        }
+    }
 }
 
 struct Statement {
     statement_type: StatementType,
+    row_to_insert: Option<Row>,
 }
 
-// part.2
-// sqlite의 "프론트 엔드"는 문자열을 구문 분석하고 바이트 코드라는 내부 표현을 출력하는 SQL 컴파일러입니다.
-// - 각 부분의 복잡성 감소 (예: 가상 머신은 구문 오류에 대해 걱정하지 않음)
-// - 일반 쿼리를 한번 컴파일하고 성능 향상을 위해 바이트 코드를 캐싱 할 수 있음
-
-// InputBuffer 구조체는 사용자 입력을 저장하는 String과 입력 길이를 추적하는 input_length 필드를 포함합니다.
-// new 메서드는 새로운 InputBuffer 인스턴스를 생성합니다.
-// read_input 메서드는 stdin에서 사용자 입력을 읽어들입니다.
-struct InputBuffer {
-    buffer: String,
-    input_length: i64,
+struct Table {
+    num_rows: usize,
+    pages: Vec<Option<Vec<u8>>>,
 }
 
-impl InputBuffer {
-    fn new() -> InputBuffer {
-        InputBuffer {
-            buffer: String::new(),
-            input_length: 0,
-        }
-    }
-
-    // read_line 메서드를 사용하여 사용자 입력을 읽어들입니다.
-    // 입력 버퍼의 마지막 문자를 제거하고, buffer 필드에 저장합니다.
-    fn read_input(&mut self) {
-        let mut input = String::new();
-        stdin().read_line(&mut input).expect("Failed to read line");
-        self.input_length = input.len() as i64 - 1;
-        self.buffer = input.trim_end().to_string();
-    }
-
-    // close 메서드는 입력 버퍼를 지우는 역할을 합니다. buffer 필드를 지우고, input_length 필드를 0으로 설정합니다.
-    fn close(&mut self) {
-        self.buffer.clear();
-        self.input_length = 0;
+// Functions
+fn new_table() -> Table {
+    Table {
+        num_rows: 0,
+        pages: vec![None; TABLE_MAX_PAGES],
     }
 }
 
-fn do_meta_command(input_buffer: &mut InputBuffer) -> MetaCommandResult {
-    // 사용자가 ".exit" 명령을 입력하면 루프가 종료되고 프로그램이 종료됩니다. 그렇지 않으면 콘솔에 오류 메시지가 출력됩니다.
-    match input_buffer.buffer.as_str() {
-        ".exit" => {
-            input_buffer.close();
-            std::process::exit(0);
-        }
-        _ => MetaCommandResult::UnrecognizedCommand,
+// Serialize a row to a byte buffer
+fn serialize_row(source: &Row, destination: &mut [u8; ROW_SIZE]) {
+    unsafe {
+        let id_ptr = source.id.to_le_bytes().as_ptr();
+        let username_ptr = source.username.as_ptr();
+        let email_ptr = source.email.as_ptr();
+
+        ptr::copy_nonoverlapping(id_ptr, destination.as_mut_ptr(), mem::size_of::<u32>());
+        ptr::copy_nonoverlapping(
+            username_ptr,
+            destination.as_mut_ptr().add(mem::size_of::<u32>()),
+            COLUMN_USERNAME_SIZE,
+        );
+        ptr::copy_nonoverlapping(
+            email_ptr,
+            destination
+                .as_mut_ptr()
+                .add(mem::size_of::<u32>() + COLUMN_USERNAME_SIZE),
+            COLUMN_EMAIL_SIZE,
+        );
     }
 }
 
-// sql 컴파일러는 사용자 입력을 읽고, 입력이 인식되지 않으면 오류 메시지를 출력합니다.
-fn prepare_statement(input_buffer: &mut InputBuffer, statement: &mut Statement) -> PrepareResult {
-    let statement_str = input_buffer.buffer.as_str();
-    if statement_str.starts_with("insert") {
-        statement.statement_type = StatementType::Insert;
-        return PrepareResult::Success;
+// Deserialize a row from a byte buffer
+fn deserialize_row(source: &[u8; ROW_SIZE]) -> Row {
+    let id = u32::from_le_bytes([source[0], source[1], source[2], source[3]]);
+
+    let mut username = [0; COLUMN_USERNAME_SIZE];
+    username.copy_from_slice(&source[4..36]);
+
+    let mut email = [0; COLUMN_EMAIL_SIZE];
+    email.copy_from_slice(&source[36..291]);
+
+    Row {
+        id,
+        username,
+        email,
     }
-    if statement_str.starts_with("select") {
-        statement.statement_type = StatementType::Select;
-        return PrepareResult::Success;
-    }
-    PrepareResult::UnrecognizedStatement
 }
 
-// 가상 머신은 바이트 코드를 실행하는 데 사용되는 가상 머신입니다.
-fn execute_statement(statement: &Statement) {
+// Find the position of a row in a table
+fn row_slot(table: &mut Table, row_num: usize) -> *mut u8 {
+    let page_num = row_num / ROWS_PER_PAGE;
+    if page_num >= TABLE_MAX_PAGES {
+        panic!("Table overflow");
+    }
+    if table.pages.get(page_num).is_none() {
+        table.pages.resize_with(page_num + 1, || None);
+    }
+    if table.pages[page_num].is_none() {
+        table.pages[page_num] = Some(vec![0; PAGE_SIZE]);
+    }
+    let row_offset = row_num % ROWS_PER_PAGE;
+    let byte_offset = row_offset * ROW_SIZE;
+    unsafe {
+        table.pages[page_num]
+            .as_mut()
+            .unwrap()
+            .as_mut_ptr()
+            .add(byte_offset)
+    }
+}
+
+// Main function to execute statement on the table
+fn execute_statement(statement: &Statement, table: &mut Table) -> ExecuteResult {
     match statement.statement_type {
-        StatementType::Insert => println!("This is where we would do an insert."),
-        StatementType::Select => println!("This is where we would do a select."),
+        StatementType::Insert => {
+            if table.num_rows >= TABLE_MAX_ROWS {
+                return ExecuteResult::TableFull;
+            }
+            let row_to_insert = statement.row_to_insert.as_ref().unwrap();
+            let slot = row_slot(table, table.num_rows);
+            serialize_row(row_to_insert, unsafe {
+                &mut *(slot as *mut [u8; ROW_SIZE])
+            });
+            table.num_rows += 1;
+            ExecuteResult::Success
+        }
+        StatementType::Select => {
+            for i in 0..table.num_rows {
+                let row =
+                    deserialize_row(unsafe { &*(row_slot(table, i) as *const [u8; ROW_SIZE]) });
+                println!("({}, {:?}, {:?})", row.id, row.username, row.email);
+            }
+            ExecuteResult::Success
+        }
     }
 }
 
-// print! 매크로를 사용하여 db >  문자열을 출력하고,
-// stdout을 플러시하여 출력을 플러시합니다.
-fn print_prompt() {
-    print!("db > ");
-    stdout().flush().unwrap();
+// ExecuteResult enum
+enum ExecuteResult {
+    Success,
+    TableFull,
 }
 
-// 사용자 입력을 읽고, 입력이 인식되지 않으면 오류 메시지를 출력하는 간단한 데이터베이스 셸을 Rust로 구현한 것입니다.
+// Main function
 fn main() {
-    // main 함수는 InputBuffer 인스턴스를 초기화하고,
-    // 사용자 입력이 인식될 때까지 루프를 반복합니다.
-    let mut input_buffer = InputBuffer::new();
-
+    let mut table = new_table();
     loop {
-        print_prompt();
-        input_buffer.read_input();
+        print!("db > ");
+        io::stdout().flush().unwrap();
 
-        if input_buffer.buffer.starts_with('.') {
-            match do_meta_command(&mut input_buffer) {
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+
+        if input.trim().starts_with('.') {
+            match do_meta_command(&input) {
                 MetaCommandResult::Success => continue,
                 MetaCommandResult::UnrecognizedCommand => {
-                    println!("Unrecognized command '{}'", input_buffer.buffer.trim());
+                    println!("Unrecognized command '{}'", input.trim());
                     continue;
                 }
             }
         }
 
-        let mut statement = Statement {
-            statement_type: StatementType::Insert,
-        };
-        match prepare_statement(&mut input_buffer, &mut statement) {
-            PrepareResult::Success => (),
-            PrepareResult::UnrecognizedStatement => {
-                println!(
-                    "Unrecognized keyword at start of '{}'",
-                    input_buffer.buffer.trim()
-                );
+        let statement = match prepare_statement(&input) {
+            Ok(statement) => statement,
+            Err(PrepareResult::Success) => {
+                println!("Syntax error. Could not parse statement '{}'", input.trim());
                 continue;
             }
-        }
+            Err(PrepareResult::SyntaxError) => {
+                println!("Syntax error. Could not parse statement '{}'", input.trim());
+                continue;
+            }
+            Err(PrepareResult::UnrecognizedStatement) => {
+                println!("Unrecognized keyword at start of '{}'", input.trim());
+                continue;
+            }
+        };
 
-        execute_statement(&statement);
-        println!("Executed.");
+        let result = execute_statement(&statement, &mut table);
+        match result {
+            ExecuteResult::Success => println!("Executed."),
+            ExecuteResult::TableFull => println!("Error: Table full."),
+        }
+    }
+}
+
+// Meta command handling
+fn do_meta_command(input: &str) -> MetaCommandResult {
+    if input.trim() == ".exit" {
+        std::process::exit(0);
+    } else {
+        MetaCommandResult::UnrecognizedCommand
+    }
+}
+
+// Statement preparation
+fn prepare_statement(input: &str) -> Result<Statement, PrepareResult> {
+    // Insert statement
+    if input.trim().starts_with("insert") {
+        let statement_parts: Vec<&str> = input.trim().split(' ').collect();
+        if statement_parts.len() != 4 {
+            return Err(PrepareResult::SyntaxError);
+        }
+        let id = statement_parts[1]
+            .parse::<u32>()
+            .map_err(|_| PrepareResult::SyntaxError)?;
+        let username = statement_parts[2];
+        let email = statement_parts[3];
+        let row = Row::new(id, username, email);
+
+        Ok(Statement {
+            statement_type: StatementType::Insert,
+            row_to_insert: Some(row),
+        })
+    // Select statement
+    } else if input.trim() == "select" {
+        Ok(Statement {
+            statement_type: StatementType::Select,
+            row_to_insert: None,
+        })
+    } else {
+        Err(PrepareResult::UnrecognizedStatement)
     }
 }
